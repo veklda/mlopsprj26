@@ -1,0 +1,576 @@
+# ============================================================================
+# Category Classification — Feature · Training · Inference Pipeline
+# ============================================================================
+# Comprehensive TOML configuration extracted from:
+#   category_classification_fti.ipynb
+#
+# This file centralises every path, constant, feature list, and hyper-parameter
+# used across the three decoupled stages:
+#   1. Feature Pipeline  (raw CSV → Hopsworks Feature Store)
+#   2. Training Pipeline (Feature Store → model artifact)
+#   3. Inference Pipeline(model artifact + new CSV → predictions)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Project metadata
+# ----------------------------------------------------------------------------
+# The [project] table is used by the pipeline orchestrator and Hopsworks
+# Model Registry to tag experiments, runs, and exported artifacts.  All
+# values are surfaced in MLflow-like metadata so that notebooks and batch
+# jobs can discover the correct model version for a given task.
+[project]
+# Human-readable project slug.  Must match the Hopsworks project name segment
+# used in the Model Registry path.
+name = "category_classification"
+
+# Internal task discriminator.  Distinguishes this config from sibling
+# pipelines (e.g. "illegality_classification") when multiple TOML files
+# live in the same repository.
+task = "category_classification"
+
+# Semantic version of the pipeline itself (not the model).  Bump when the
+# feature engineering logic or training protocol changes.
+version = "1.0.0"
+
+# Free-text description shown in the Hopsworks Model Registry UI.
+description = "DSA statement-of-reasons category classifier (Task A)"
+
+# Metric used for early-stopping, model selection, and registry ranking.
+# "macro_f1" treats all statement categories equally, which is important
+# because the DSA dataset is heavily imbalanced.
+primary_metric = "macro_f1"
+
+# ----------------------------------------------------------------------------
+# Paths
+# ----------------------------------------------------------------------------
+# All paths in this section are relative to the working directory of the
+# notebook or batch job.  They act as the local "scratch pad" before
+# artifacts are uploaded to Hopsworks or Cloud Storage.
+[paths]
+# Pickled Python object containing the final trained model, preprocessing
+# pipelines (ColumnTransformer + TF-IDF vectorisers), and label maps.
+# Produced by the Training Pipeline and consumed by the Inference Pipeline.
+model_artifact = "category_best_model.pkl"
+
+# Temporary directory used by joblib.dump() before the artifact is
+# compressed and pushed to Hopsworks.  Deleted automatically after upload
+# unless --keep-export-dir is passed.
+model_export_dir = "category_model_export"
+
+# CSV log written by HalvingRandomSearchCV.  Contains one row per candidate
+# hyper-parameter set with fold scores, mean_test_score, and rank.
+# Useful for post-hoc analysis of the search landscape.
+cv_results = "category_lgbm_t1_cv_results.csv"
+
+# Batch inference output.  One row per input statement with the predicted
+# category, predicted probabilities for all classes, and original identifiers.
+predictions = "category_predictions.csv"
+
+# JSON side-car written alongside model_artifact.  Stores:
+#   • label encoders (category → int, int → category)
+#   • lists of categorical / numerical / text feature names
+#   • version pins for Hopsworks Feature Groups
+# Needed at inference time so the pipeline can rebuild the feature matrix
+# even if the training notebook is offline.
+metadata = "category_metadata.json"
+
+# ----------------------------------------------------------------------------
+# FA-0 / IP-7 Data Acquisition (CloudFront daily parquet zips)
+# ----------------------------------------------------------------------------
+# FA-0 is the "Feature Acquisition" step that downloads raw DSA Transparency
+# Database dumps from the European Commission CloudFront distribution.
+# The resulting Parquet files are the input to the Feature Pipeline.
+[fa0]
+# Base URL of the EC CloudFront distribution that hosts the daily chunked
+# Parquet dumps.  Source: https://dsa.pages.code.europa.eu/transparency-database/dsa-tdb/data_sources.html#raw-data
+cloudfront_base    = "https://d3vax7phxnku8l.cloudfront.net"
+
+# Sub-path appended to cloudfront_base to reach the "daily_dumps_chunked"
+# folder structure (YYYY/MM/DD/chunk_*.parquet).
+cloudfront_subpath = "/raw/pqt/data/tdb_data/global___full/daily_dumps_chunked"
+
+# --- Parallelism knobs ---
+# Number of concurrent day-level downloads.  Each day is a separate HTTP
+# prefix, so parallelism is limited by network bandwidth and CloudFront
+# connection limits.  8 is a sweet spot on a 1 Gbps link.
+dl_workers              = 8
+
+# Number of concurrent chunk downloads *inside* a single day.  Chunks are
+# small (~50 k rows), so 4 parallel streams per day keeps CPU and I/O
+# balanced without hammering the remote server.
+chunk_workers           = 4
+
+# Threads used when loading already-downloaded Parquet folders from disk
+# (the "load existing data" widget path).  I/O bound, so 16 threads
+# saturates a local NVMe SSD.
+file_read_workers       = 16
+
+# --- Row sampling ---
+# Target number of rows to keep after stratified sampling.  This default
+# is injected into both the "download" and "load" widget UIs so that
+# developers get a reasonably sized dataset (~15 k rows) without
+# accidentally pulling the full multi-billion-row dump.
+default_target_rows     = 15000
+
+# Fallback rows-per-chunk estimate used when the first-chunk probe fails
+# (e.g. the chunk file is missing or empty).  The sampler uses this to
+# decide how many chunks to download before applying stratified sampling.
+rows_per_chunk_estimate = 50000
+
+# Default local directory for downloaded Parquet files.  The FA-0 widget
+# pre-fills this value, but users can override it in the UI.
+data_folder = "data"
+
+# Default date range for the download widget (inclusive start, inclusive end).
+# Four days gives ~200 k–400 k raw rows, which after sampling yields the
+# 15 k target above with a comfortable margin.
+download_start_date = "2026-05-02"
+download_end_date   = "2026-05-05"
+
+# ----------------------------------------------------------------------------
+# Reproducibility
+# ----------------------------------------------------------------------------
+# Fixed random seeds and cross-validation protocol.  Changing any value
+# here will alter train/test splits, model initialisation, and therefore
+# the final macro-F1 score.
+[reproducibility]
+# Master random seed for NumPy, scikit-learn, LightGBM, and Python's
+# random module.  42 is the convention across the repository.
+random_state = 42
+
+# Number of stratified folds used by the main HalvingRandomSearchCV.
+# 5 folds gives a good bias/variance trade-off for model selection while
+# keeping runtime acceptable on CPU.
+n_cv_folds = 5
+
+# ----------------------------------------------------------------------------
+# Domain constants
+# ----------------------------------------------------------------------------
+# Hard-coded values that come from the DSA Transparency Database schema
+# and are referenced in both feature engineering and metric computation.
+[domain]
+# The fallback label used by the dataset owner when a statement does not
+# map to any specific category.  The pipeline sometimes collapses rare
+# categories into this bucket during exploratory analysis.
+other_category = "STATEMENT_CATEGORY_OTHER_VIOLATION_TC"
+
+# Common prefix shared by every category label in the raw dataset.
+# Stripping this prefix shortens class names in plots and logs.
+prefix = "STATEMENT_CATEGORY_"
+
+# --- Text columns used at different tiers ---
+# The pipeline supports three tiers of text richness:
+#   T1 – structured features only (no text)
+#   T2 – structured + two free-text columns
+#   T3 – structured + three free-text columns
+# Each key below maps to the exact column name in the raw CSV/Parquet.
+
+# T2/T3 primary policy text: the statutory ground cited for the takedown.
+text_col = "incompatible_content_ground"
+
+# T2/T3 free-text rationale: human-readable explanation written by the
+# reporting entity.
+text_col_2 = "incompatible_content_explanation"
+
+# T3 only: detailed decision facts (longer prose, often empty).
+text_col_3 = "decision_facts"
+
+# ----------------------------------------------------------------------------
+# External platform credentials (override via env vars in production)
+# ----------------------------------------------------------------------------
+# Hopsworks is the central Feature Store and Model Registry.  All sub-tables
+# under [hopsworks] describe how the pipeline maps local data to remote
+# Hopsworks entities.
+[hopsworks]
+# FQDN of the Hopsworks cluster.  Override with env var HOPSWORKS_HOST.
+host = "eu-west.cloud.hopsworks.ai"
+
+# Hopsworks project name.  Override with env var HOPSWORKS_PROJECT.
+project = "project_mlops_57321"
+
+# NEVER commit real API keys — set the HOPSWORKS_API_KEY environment variable instead.
+# The key below is a placeholder used only in local integration tests;
+# production jobs inject the secret via the CI/CD vault.
+api_key = ""
+
+# --- Structured Feature Group ---
+# Holds all engineered categorical and numerical columns.  Kept separate
+# from the text Feature Groups so that online serving can fetch only the
+# structured vector for low-latency predictions if desired.
+[hopsworks.feature_group]
+name = "category_features"
+version = 1
+description = "Category classification structured features. Joined to the text FG via row_id in the Feature View."
+# online_enabled = true allows real-time serving via the Hopsworks REST API.
+online_enabled = true
+# Column used by Hopsworks for time-travel and event-time aware splits.
+event_time_col = "application_date"
+
+# --- Text Feature Group 1 ---
+# Stores the primary policy text (incompatible_content_ground) as a
+# free-text feature.  Online serving is enabled so that the Inference
+# Pipeline can retrieve the latest text for a given row_id.
+[hopsworks.feature_group_text_1]
+name = "category_features_text_1"
+version = 1
+description = "Text column incompatible_content_ground for category classification."
+online_enabled = true
+
+# --- Text Feature Group 2 ---
+# Stores the free-text rationale (incompatible_content_explanation).
+[hopsworks.feature_group_text_2]
+name = "category_features_text_2"
+version = 1
+description = "Text column incompatible_content_explanation for category classification."
+online_enabled = true
+
+# --- Text Feature Group 3 ---
+# Stores decision facts (decision_facts).  Usually the longest and sparsest
+# text column, only included in T3 experiments.
+[hopsworks.feature_group_text_3]
+name = "category_features_text_3"
+version = 1
+description = "Text column decision_facts for category classification."
+online_enabled = true
+
+# --- Model Registry ---
+# Logical name under which the best model artifact is versioned.  Each
+# training run that beats the previous primary_metric creates a new
+# version automatically.
+[hopsworks.model_registry]
+name = "category_classifier"
+description = "Best category classifier by macro F1"
+
+# --- Feature View ---
+# A Hopsworks Feature View joins the structured Feature Group with the
+# three text Feature Groups on row_id.  It also exposes the train/test
+# split logic (chronological, 80/20) so that both Training and Inference
+# pipelines read from the same consistent snapshot.
+[hopsworks.feature_view]
+name = "category_features_view"
+version = 1
+description = "Category features view for Hopsworks-managed train/test splitting"
+
+# ----------------------------------------------------------------------------
+# Feature Pipeline (FP)
+# ----------------------------------------------------------------------------
+# Parameters that govern how raw CSV rows are transformed into the
+# feature matrix that is written to Hopsworks.  Changing any value here
+# invalidates previously cached Feature Group data and triggers a full
+# back-fill.
+[feature_pipeline]
+# Columns that MUST NOT be used as features because they are either the
+# target variable or derived directly from it (data leakage).
+#   • category              – the primary target
+#   • category_specification – fine-grained sub-label, almost perfectly
+#     correlated with category
+#   • category_addition      – auxiliary label, also leaky
+leakage_columns = [
+    "category",
+    "category_specification",
+    "category_addition",
+]
+
+# Train / test split ratio.  0.2 means 20 % of rows (the most recent 20 %
+# by application_date) are held out for testing.  Chronological splitting
+# is essential because DSA statements arrive as a time series; random
+# splitting would leak future information into the training set.
+test_size = 0.2
+# stratify = false  # chronological split is used instead
+
+# Missing-value placeholders used during FP-1 (raw cleaning) and FP-3
+# (feature engineering).  Strings that are empty or whitespace-only are
+# replaced by "__MISSING__" so that downstream encoders treat them as a
+# valid category.  Numerical missings are filled with -1 and later
+# flagged via an indicator column if needed.
+missing_string = "__MISSING__"
+missing_numeric = -1
+
+# Width of the rolling window (in hours) for platform-level aggregate
+# features such as "statements_by_platform_last_3h".  A 3-hour window
+# captures recent burstiness without smoothing away diurnal patterns.
+rolling_window_hours = 3
+
+# --- Parallelism inside the Feature Pipeline ---
+# Maximum threads for per-platform rolling-feature computation.  Each
+# platform is processed independently, so 8 threads saturates a modern
+# laptop CPU.
+platform_workers          = 8
+
+# Number of rows sampled from the training split to fit the
+# ColumnTransformer (OrdinalEncoder, TargetEncoder, StandardScaler).
+# 1 000 rows is enough to discover all categories and set scaler means
+# without reading the full dataset into memory.
+preprocessor_fit_sample   = 1000
+
+# ----------------------------------------------------------------------------
+# Feature definitions
+# ----------------------------------------------------------------------------
+# Explicit lists of which columns are treated as categorical, numerical,
+# or text.  These lists are serialised into metadata.json and validated
+# at inference time to guarantee that the serving feature matrix has the
+# exact same schema as the training matrix.
+
+# --- Categorical features ---
+# Produced by FP-1 (raw column passthrough) and FP-3 (engineered flags).
+# Every column listed here must be present in the structured Feature Group.
+[features.categorical]
+columns = [
+    "source_type",                       # who filed the statement (e.g. Trusted Flagger, user)
+    "automated_detection",               # boolean flag: was detection automated?
+    "automated_decision",                # boolean flag: was the final decision automated?
+    "platform_name",                     # platform identifier (high cardinality)
+    "content_language",                  # ISO language code (high cardinality)
+    "account_type",                      # type of account that posted the content
+    "incompatible_content_illegal",      # flag: does the statement allege illegality?
+    "content_type_primary",              # main content modality (text, image, video …)
+    "territorial_scope_primary",         # primary country code (high cardinality)
+    "decision_ground",                   # statutory basis for the decision
+    # co-submitted visibility outcome (same DSA form field, not leaky for Task A)
+    "decision_visibility_primary",       # primary visibility restriction applied
+]
+
+# --- Categorical encoding strategy ---
+# scikit-learn ColumnTransformer configuration.  Low-cardinality columns
+# get OrdinalEncoder (fast, tree-friendly).  High-cardinality columns
+# get TargetEncoder (smooths rare categories, prevents huge sparse matrices).
+[features.categorical.encoding]
+# Threshold between low and high cardinality is implicit: if a column has
+# fewer than ~15 unique values it is listed here.
+low_cardinality = [
+    "source_type",
+    "automated_detection",
+    "automated_decision",
+    "incompatible_content_illegal",
+    "content_type_primary",
+    "decision_ground",
+    "decision_visibility_primary",
+]
+
+# Columns with many unique values (platforms, languages, territories).
+# TargetEncoder replaces each category with the mean target value of that
+# category, regularised by the global mean.
+high_cardinality = [
+    "platform_name",
+    "content_language",
+    "account_type",
+    "territorial_scope_primary",
+]
+
+# OrdinalEncoder: unknown categories seen at inference time are mapped to
+# the integer -1 instead of raising an error.
+ordinal_encoder_params = { handle_unknown = "use_encoded_value", unknown_value = -1 }
+
+# TargetEncoder: fixed random seed for the internal random hold-out used
+# to compute target means (scikit-learn >= 1.3).
+target_encoder_params = { random_state = 42 }
+
+# --- Numerical features ---
+# All columns listed here are passed through StandardScaler inside the
+# ColumnTransformer.  They are engineered in FP-3 from raw dates, counts,
+# and decision-action vectors.
+[features.numerical]
+columns = [
+    # Cardinality counts
+    "territorial_scope_count",           # number of countries in territorial_scope list
+
+    # Date decomposition (application = when the statement was submitted)
+    "app_year",
+    "app_month",
+
+    # Date decomposition (content = when the flagged content was created)
+    "content_year",
+
+    # Text-length proxy for decision_facts (used even in T1 because it is
+    # a scalar, not a text vector)
+    "decision_facts_len",
+
+    # Temporal lag feature: days between content creation and application
+    "content_application_lag_days",
+
+    # Decision-severity block: binary flags derived from decision_action
+    "has_monetary_decision",             # fine or monetary penalty imposed
+    "has_provision_decision",            # service provision restricted
+    "has_account_decision",              # account suspended or terminated
+    "total_decision_actions",            # count of distinct actions taken
+    "is_multi_action_decision",          # flag: more than one action applied
+
+    # Multi-type / multi-visibility signals
+    "content_type_count",                # number of content types listed
+    "visibility_decision_count",         # number of visibility restrictions
+]
+
+# --- Text features ---
+# TF-IDF vectoriser configurations for each free-text column.  The keys
+# (tfidf_icg, tfidf_ice, tfidf_df) match the column nicknames used in
+# the notebook preprocessor code.
+[features.text]
+# TF-IDF for incompatible_content_ground (primary policy text).
+#   • max_features = 5000  – generous because legal grounds repeat with
+#     slight variations; 5 k dimensions captures most discriminative n-grams.
+#   • ngram_range = [1, 2] – unigrams + bigrams capture phrases like
+#     "hate speech" and "child safety".
+#   • sublinear_tf = true  – apply 1 + log(tf) to dampen frequent terms.
+#   • min_df = 2           – ignore terms that appear in fewer than 2 rows.
+tfidf_icg = { max_features = 5000, ngram_range = [1, 2], sublinear_tf = true, min_df = 2 }
+
+# TF-IDF for incompatible_content_explanation (free-text rationale).
+# Smaller max_features (3 000) because rationale text is noisier and more
+# idiosyncratic than statutory grounds.
+tfidf_ice = { max_features = 3000, ngram_range = [1, 2], sublinear_tf = true, min_df = 2 }
+
+# TF-IDF for decision_facts (long prose, T3 only).
+# Only 2 000 dimensions because this column has the lowest fill rate and
+# the highest vocabulary noise.
+tfidf_df  = { max_features = 2000, ngram_range = [1, 2], sublinear_tf = true, min_df = 2 }
+
+# Minimum fraction of non-empty rows required before fitting TF-IDF.
+# If a text column has fill rate < 5 % the pipeline raises an error
+# because the TF-IDF matrix would be too sparse to generalise.  This guard
+# prevents silent degradation when a new data dump changes column availability.
+min_fill_rate = 0.05
+
+# ----------------------------------------------------------------------------
+# Training Pipeline (TP)
+# ----------------------------------------------------------------------------
+# Settings for model selection and hyper-parameter search.  These values
+# control compute budget and search granularity, not model behaviour directly.
+[training]
+# HalvingRandomSearchCV progressively allocates more resources (more training
+# data) to the best candidates.  n_candidates = 50 means 50 random points
+# are sampled from the LightGBM search space; factor = 3 means only one
+# third of candidates survive each successive halving round.  This yields
+# a 3–5× speed-up over vanilla RandomizedSearchCV with comparable final
+# performance.
+halving_search = { n_candidates = 50, factor = 3 }
+
+# LogisticRegression is used as a fast, interpretable baseline.  Because it
+# trains in seconds, we can afford only 3 CV folds for the baseline report
+# without materially affecting the final model selection.  Using fewer folds
+# here keeps the overall pipeline runtime under the CI limit.
+lr_cv_folds = 3
+
+# ----------------------------------------------------------------------------
+# Model hyper-parameters & search spaces
+# ----------------------------------------------------------------------------
+# Each [models.*] table defines a candidate estimator.  The Training
+# Pipeline trains every enabled model, compares them on primary_metric,
+# and promotes the winner to the Hopsworks Model Registry.
+
+# --- Dummy baseline ---
+# Most-frequent classifier: predicts the majority class for every sample.
+# Provides the absolute floor for macro-F1 (often ~0.10–0.15 on this
+# dataset).  Any real model must beat this by a wide margin.
+[models.dummy]
+strategy = "most_frequent"
+
+# --- Logistic Regression ---
+# Lightweight linear baseline with L2 or elastic-net regularisation.
+# saga solver supports all penalties and is efficient for sparse TF-IDF
+# matrices.  class_weight = "balanced" up-weights rare categories to
+# counteract the severe class imbalance in the DSA dataset.
+[models.logistic_regression]
+solver      = "saga"
+max_iter    = 1000          # Enough for saga convergence on sparse matrices
+tol         = 1e-3          # Stop when objective improvement < 0.001
+class_weight = "balanced"   # Inverse-frequency weighting per class
+n_jobs      = -1            # Use all CPU cores for multiclass one-vs-rest
+
+# --- LightGBM (main model) ---
+# Gradient-boosted decision trees.  Chosen as the primary model because
+# it natively handles mixed categorical/numerical features when coupled
+# with TargetEncoder, trains quickly, and scales to millions of rows.
+[models.lightgbm]
+objective = "multiclass"    # Softmax loss for >2 classes
+class_weight = "balanced"   # Same re-weighting strategy as LR
+random_state = 42           # Reproducible row sub-sampling and feature sampling
+n_jobs = 1                  # LightGBM internal threading; set to 1 when
+                            # HalvingRandomSearchCV already parallelises across folds.
+verbose = -1                # Suppress LightGBM periodic logging noise
+device = "cpu"              # "cpu" | "gpu" | "cuda" — override detect_lgb_device() result
+                            # Force CPU even if a GPU is present (useful for CI).
+
+# Search space for HalvingRandomSearchCV.
+# Each entry is a distribution compatible with scikit-learn ParameterSampler.
+#   • randint    – uniform integer in [low, high)
+#   • uniform    – uniform float in [low, high)
+#   • loguniform – uniform in log-space (good for learning rates, regularisers)
+[models.lightgbm.search_space]
+n_estimators      = { type = "randint", low = 50, high = 301 }
+max_depth         = { type = "randint", low = 3, high = 10 }
+learning_rate     = { type = "loguniform", low = 1e-3, high = 0.4 }
+num_leaves        = { type = "randint", low = 15, high = 127 }
+subsample         = { type = "uniform", low = 0.6, high = 1.0 }
+colsample_bytree  = { type = "uniform", low = 0.6, high = 1.0 }
+reg_alpha         = { type = "loguniform", low = 1e-2, high = 5.0 }
+reg_lambda        = { type = "loguniform", low = 0.1, high = 5.0 }
+min_child_samples = { type = "randint", low = 5, high = 51 }
+
+# --- Two-stage LightGBM (T1, T2, T3) ---
+# Some experiments split the problem into stage-1 (coarse category) and
+# stage-2 (fine category) classifiers.  These fixed hyper-parameters are
+# used for both stages when the two-stage architecture is enabled.
+# They are deliberately conservative (300 trees, moderate learning rate)
+# to avoid overfitting the smaller stage-specific training sets.
+[models.lightgbm.two_stage]
+n_estimators = 300
+learning_rate = 0.05
+num_leaves = 63
+class_weight = "balanced"
+random_state = 42
+n_jobs = -1
+verbose = -1
+
+# --- Flat LightGBM for T2/T3 (no search) ---
+# When training a flat (non-hierarchical) LightGBM directly on the T2 or
+# T3 feature matrices, hyper-parameter search is skipped and these fixed
+# values are used instead.  400 trees with a low learning rate gives
+# stable, near-optimal performance without the cost of search.
+[models.lightgbm.tier_flat_fixed]
+n_estimators = 400
+learning_rate = 0.05
+num_leaves = 63
+class_weight = "balanced"
+random_state = 42
+n_jobs = -1
+verbose = -1
+
+# ----------------------------------------------------------------------------
+# Inference Pipeline (IP)
+# ----------------------------------------------------------------------------
+# Controls the live-streaming dashboard that scores incoming statements
+# in real time and renders a terminal / notebook widget UI.
+[inference]
+# Sleep duration between consecutive row predictions.  0.3 s gives a
+# readable animation speed (~3 rows/sec) without overwhelming the display.
+stream_delay_seconds    = 0.3
+
+# Maximum number of rows to score in a single live-stream session.  After
+# 3 000 rows the loop exits so that memory usage stays bounded.
+stream_max_rows         = 3000
+
+# Redraw the dashboard charts every N rows.  20 balances visual smoothness
+# with rendering overhead.
+stream_graph_every      = 20
+
+# Number of most-recent rows shown in the scrolling feed panel.
+stream_feed_lines       = 14
+
+# How many latest Parquet chunks to pull from Hopsworks for the live
+# stream source.  2 chunks ≈ 1–2 days of data, enough to demonstrate
+# real-time drift without a huge download.
+stream_tail_chunks      = 2
+
+# Truncate displayed cell values to this character width so that the
+# dashboard table fits on a standard 1280-pixel terminal.
+stream_column_max_chars = 18
+
+# Default columns shown in the live feed table.  Chosen to be human-
+# interpretable and relevant for spot-checking model behaviour.
+stream_default_columns  = [
+    "platform_name",
+    "created_at",
+    "decision_ground",
+    "content_type",
+    "decision_visibility",
+]
