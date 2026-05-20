@@ -3,11 +3,7 @@
 **Note: Set project and API key in category_classification_fti.toml** (`project`, `api_key`)
 
 1. **Docker** — quickest, works identically on Windows, macOS, and Linux.
-2. **Manual setup** — replicates what the first code cell of
-   `category_classification_f.ipynb` does automatically. Use this if you prefer a
-   local Python environment or if the Docker route is not available.
-
-For a description of the three pipelines, see **tutorial.html**.
+2. **Manual setup** — Use this if you prefer a local Python environment or if the Docker route is not available.
 
 **Note**: Data set size has been set to 15'000 rows in the TOML file to speed up the
 process. Locally tested with 240'000 rows.
