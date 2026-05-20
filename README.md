@@ -180,18 +180,73 @@ Select **Category Classification (.venv)** as the kernel in each notebook.
 
 ---
 
-## Notebook Execution Order
+## FTI Pipeline
 
-Run the three notebooks in sequence:
+The workflow is split into three decoupled stages.  
+Configuration is centralised in `category_classification_fti.toml`; shared
+helper code lives in `category_classification.py`.
 
-| Step | Notebook | Description |
-|------|----------|-------------|
-| 1 | `category_classification_f.ipynb` | Feature Pipeline — downloads / loads raw parquet data, engineers features, uploads to Hopsworks Feature Store |
-| 2 | `category_classification_t.ipynb` | Training Pipeline — reads features from the Feature Store, searches hyper-parameters, trains and registers the best model |
-| 3 | `category_classification_i.ipynb` | Inference Pipeline — streams new data through the registered model and writes predictions to CSV |
+### Feature Extraction (`category_classification_f.ipynb`)
 
-Each notebook is self-contained; the shared utility code lives in
-`category_classification.py`.
+- **Data acquisition** – Downloads daily Parquet dumps from the EC DSA
+  Transparency Database (CloudFront) or loads existing local chunks.
+- **Stratified sampling** – Draws a configurable number of rows (default
+  15 000, tested up to 240 000) while preserving category distribution.
+- **Cleaning & parsing** – Handles missing values, stringifies lists, and
+  extracts primary items / counts from multi-value columns (`content_type`,
+  `territorial_scope`, `decision_visibility`).
+- **Feature engineering** – Produces **28 structured features**:
+  - *11 categorical* (`source_type`, `automated_detection`, `platform_name`,
+    …) – low-cardinality columns are ordinal-encoded, high-cardinality
+    columns are target-encoded.
+  - *17 numerical* (`territorial_scope_count`, date parts, decision-action
+    flags, and 3-hour rolling platform aggregates).
+- **Text extraction** – Pulls the three free-text columns
+  (`incompatible_content_ground`, `incompatible_content_explanation`,
+  `decision_facts`) that feed TF-IDF in later tiers.
+- **Chronological split** – Splits 80/20 by `application_date` (older rows
+  train, newer rows test) to avoid future leakage.
+- **Feature Store upload** – Writes structured and text columns into
+  separate Hopsworks Feature Groups and creates a Feature View that joins
+  them on `row_id`.
+
+### Training (`category_classification_t.ipynb`)
+
+- **Feature retrieval** – Reads the engineered feature matrix from the
+  Hopsworks Feature View.
+- **Preprocessing** – Fits a `ColumnTransformer` on a subsample
+  (`preprocessor_fit_sample = 1 000`) applying ordinal / target encoding
+  and `StandardScaler`.
+- **TF-IDF vectorisation (Tier 2/3)** – Transforms the three text columns
+  into sparse vectors (5 000 + 3 000 + 2 000 dimensions) with unigrams,
+  bigrams, and sublinear TF.
+- **Baseline models** – Trains a dummy (most-frequent) and a balanced
+  `LogisticRegression` (saga solver) for reference.
+- **LightGBM search** – Explores 50 random hyper-parameter candidates via
+  `HalvingRandomSearchCV` (factor 3, 5 stratified folds) over tree count,
+  depth, learning rate, regularisation, etc.
+- **Architectures compared** – Evaluates flat vs. two-stage classifiers:
+  - *Flat* – single multiclass LightGBM.
+  - *Two-stage* – Stage-1 binary (OTHER vs. NOT-OTHER) and Stage-2
+    multiclass on the non-OTHER subset.
+- **Model selection** – Ranks pipelines by **macro F1**; the best Tier-2
+  Two-Stage LightGBM (macro F1 ≈ 0.869) is promoted.
+- **Registration** – Serialises the winning artifact, preprocessors, label
+  maps, and `category_metadata.json` to the Hopsworks Model Registry.
+
+### Inference (`category_classification_i.ipynb`)
+
+- **Artifact loading** – Retrieves the registered model, preprocessors,
+  and metadata from Hopsworks (or local `category_best_model.pkl`).
+- **Local feature engineering** – Re-applies the identical transformation
+  logic via `CategoryPredictor` on raw incoming rows.
+- **Rolling-window warm start** – Optionally seeds 3-hour platform
+  aggregates with `history_df` to prevent cold-start degradation.
+- **Batch scoring** – Outputs predicted category, confidence, and
+  per-class probabilities to `category_predictions.csv`.
+- **Live stream** – Pulls the latest Parquet chunks, scores rows in real
+  time (~3 rows/sec), and renders a dashboard tracking macro F1,
+  precision, recall, and aggregate TP/FP/FN.
 
 ---
 
