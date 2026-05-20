@@ -186,7 +186,7 @@ text_col_3 = "decision_facts"
 host = "eu-west.cloud.hopsworks.ai"
 
 # Hopsworks project name.  Override with env var HOPSWORKS_PROJECT.
-project = "project_mlops_57321"
+project = ""
 
 # NEVER commit real API keys — set the HOPSWORKS_API_KEY environment variable instead.
 # The key below is a placeholder used only in local integration tests;

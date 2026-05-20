@@ -1,5 +1,7 @@
 # Category Classification
 
+**Note: Set project and API key in category_classification_fti.toml** (`project`, `api_key`)
+
 1. **Docker** — quickest, works identically on Windows, macOS, and Linux.
 2. **Manual setup** — replicates what the first code cell of
    `category_classification_f.ipynb` does automatically. Use this if you prefer a
