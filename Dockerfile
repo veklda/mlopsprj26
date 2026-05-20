@@ -79,7 +79,6 @@ COPY category_classification.py \
      category_classification_t.ipynb \
      category_classification_i.ipynb \
      category_classification_fti.toml \
-     category_metadata.json \
      ./
 
 # -----------------------------------------------------------------------------
